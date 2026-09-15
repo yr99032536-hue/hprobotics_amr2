@@ -6,8 +6,12 @@ from geometry_msgs.msg import Twist
 from helper_msgs.msg import ObstacleDecision
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from tf2_ros import TransformBroadcaster
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
+from sensor_msgs.msg import LaserScan
+from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 
+from helper_control.directional_safety import DirectionalSafety, StopLatch
 from helper_control.kinematics_engine import KinematicsEngine
 from helper_control.md200t_driver import MD200TDriver
 from helper_control.robot_parameters import RobotParameters
@@ -28,6 +32,10 @@ class MotorDriverNode(Node):
         self.cfg = RobotParameters()
         self._declare_parameters()
         self._load_parameters()
+        initial_pose = tuple(float(self.get_parameter(name).value) for name in (
+            'initial_odom_x', 'initial_odom_y', 'initial_odom_yaw'))
+        if not all(math.isfinite(value) for value in initial_pose):
+            raise ValueError('Initial odometry pose must be finite')
 
         self.kinematics = KinematicsEngine(self.cfg)
 
@@ -81,10 +89,36 @@ class MotorDriverNode(Node):
         self.obstacle_distance = math.inf
         self.last_obstacle_time = None
         self.obstacle_states = {}
+        self.directional_enabled = self.get_parameter('directional_safety_enabled').value
+        self.directional_scan = None
+        self.directional_stamp = None
+        self.directional_cache = {}
+        self.directional_latch = StopLatch()
+        self.directional_reason = None
+        if self.directional_enabled:
+            if self.get_parameter('directional_legacy_scan_filter').value:
+                self.get_logger().warn(
+                    'LEGACY SCAN FILTER ACTIVE: sensor -40..40 deg and ranges '
+                    'outside 0.15..8m excluded. Rear blind sector; NOT verified '
+                    'self filtering. Supervised low-speed operation only.')
+            self.scan_tf_buffer = Buffer()
+            self.scan_tf_listener = TransformListener(self.scan_tf_buffer, self)
+            self.scan_sub = self.create_subscription(
+                LaserScan, self.get_parameter('directional_scan_topic').value,
+                self.directional_scan_callback, qos_profile_sensor_data)
+            self.get_logger().warn(
+                'EXPERIMENTAL directional safety: raw scan replaces scalar '
+                f'obstacle decisions; max {DirectionalSafety.max_linear} m/s, '
+                f'{DirectionalSafety.max_angular} rad/s. '
+                'Physical emergency stop is independent. Validate footprint first.')
+            self.get_logger().info(
+                'Directional finite-point sweep v2: '
+                f'footprint={DirectionalSafety.bounds}, '
+                f'margin={DirectionalSafety.margin:.3f}m, '
+                'partial scan gaps are diagnostic only; '
+                'all-invalid scan, FOV, freshness and TF checks retained')
 
-        self.x = 0.0
-        self.y = 0.0
-        self.theta = 0.0
+        self.x, self.y, self.theta = initial_pose
         self.last_odom_time = self.get_clock().now()
 
         self.cmd_sub = self.create_subscription(
@@ -191,6 +225,12 @@ class MotorDriverNode(Node):
         self.declare_parameter('stop_on_unknown', True)
         self.declare_parameter('obstacle_timeout', 1.0)
         self.declare_parameter('dry_run_log_period', 1.0)
+        self.declare_parameter('directional_safety_enabled', False)
+        self.declare_parameter('directional_scan_topic', '/perception/scan/raw')
+        self.declare_parameter('directional_legacy_scan_filter', False)
+        self.declare_parameter('initial_odom_x', 0.0)
+        self.declare_parameter('initial_odom_y', 0.0)
+        self.declare_parameter('initial_odom_yaw', 0.0)
 
     def _load_parameters(self):
         self.cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
@@ -315,10 +355,49 @@ class MotorDriverNode(Node):
             'time': self.last_obstacle_time,
         }
 
+    def directional_scan_callback(self, msg):
+        self.directional_scan = None
+        self.directional_stamp = None
+        self.directional_cache.clear()
+        try:
+            stamp = Time.from_msg(msg.header.stamp)
+            age = (self.get_clock().now() - stamp).nanoseconds / 1e9
+            if not 0 <= age <= 0.3:
+                return
+            transform = self.scan_tf_buffer.lookup_transform(
+                'base_link', msg.header.frame_id, stamp).transform
+            q = transform.rotation
+            # Only planar LiDAR mounting is supported by this checker.
+            if abs(q.x) > 0.01 or abs(q.y) > 0.01:
+                return
+            yaw = math.atan2(2 * q.w * q.z, 1 - 2 * q.z * q.z)
+            self.directional_scan = DirectionalSafety(
+                msg.ranges, msg.angle_min, msg.angle_increment,
+                msg.range_min, msg.range_max,
+                (transform.translation.x, transform.translation.y, yaw),
+                legacy_scan_filter=self.get_parameter(
+                    'directional_legacy_scan_filter').value)
+            self.directional_stamp = stamp
+        except Exception as error:
+            self.get_logger().warn(
+                f'Directional scan/TF unavailable: {error}', throttle_duration_sec=2.0)
+
     def cmd_vel_callback(self, msg):
+        linear, angular = msg.linear.x, msg.angular.z
+        if not math.isfinite(linear) or not math.isfinite(angular):
+            self.target_left_rpm = self.target_right_rpm = 0
+            if self.directional_enabled:
+                self.directional_latch.blocked = True
+            return
+        if self.directional_enabled:
+            self.directional_latch.command(linear, angular)
+            linear = max(-DirectionalSafety.max_linear,
+                         min(DirectionalSafety.max_linear, linear))
+            angular = max(-DirectionalSafety.max_angular,
+                          min(DirectionalSafety.max_angular, angular))
         left_rpm, right_rpm = self.kinematics.inverse_kinematics(
-            msg.linear.x,
-            msg.angular.z,
+            linear,
+            angular,
         )
 
         self.target_left_rpm = left_rpm
@@ -460,6 +539,9 @@ class MotorDriverNode(Node):
             'PID210 feedback: '
             f'motor1={feedback["motor1_rpm"]}, '
             f'motor2={feedback["motor2_rpm"]}, '
+            f'target_wheel=({self.target_left_rpm:.0f},{self.target_right_rpm:.0f}), '
+            f'ramped_wheel=({self.current_left_rpm:.0f},{self.current_right_rpm:.0f}), '
+            f'status=({feedback["motor1_status"]},{feedback["motor2_status"]}), '
             f'left={left_rpm:.1f}, '
             f'right={right_rpm:.1f}'
         )
@@ -548,6 +630,8 @@ class MotorDriverNode(Node):
         self.actual_right_rpm = 0
 
     def apply_safety_gate(self, left_rpm, right_rpm):
+        if self.directional_enabled:
+            return self.apply_directional_gate(left_rpm, right_rpm)
         if not self.safety_stop_enabled:
             self.safety_stop_active = False
             return left_rpm, right_rpm
@@ -576,6 +660,39 @@ class MotorDriverNode(Node):
         if should_stop:
             return 0, 0
         return left_rpm, right_rpm
+
+    def apply_directional_gate(self, left_rpm, right_rpm):
+        if left_rpm == 0 and right_rpm == 0:
+            # Zero output is always permitted; only an explicit command clears latch.
+            self.safety_stop_active = True
+            return 0, 0
+        allowed, reason = False, 'scan_or_tf_stale'
+        if self.directional_scan is not None and self.directional_stamp is not None:
+            age = (self.get_clock().now() - self.directional_stamp).nanoseconds / 1e9
+            if 0 <= age <= 0.3:
+                key = (left_rpm, right_rpm)
+                if key not in self.directional_cache:
+                    self.directional_cache[key] = self.directional_scan.check(
+                        *self.kinematics.forward_kinematics(*key))
+                allowed, reason = self.directional_cache[key]
+                # Ramping must not carry the robot along an unsafe old direction.
+                current = (self.current_left_rpm, self.current_right_rpm)
+                if allowed and current != key and any(current):
+                    if current not in self.directional_cache:
+                        self.directional_cache[current] = self.directional_scan.check(
+                            *self.kinematics.forward_kinematics(*current))
+                    allowed, reason = self.directional_cache[current]
+                age = (self.get_clock().now() - self.directional_stamp).nanoseconds / 1e9
+                if not 0 <= age <= 0.3:
+                    allowed, reason = False, 'scan_or_tf_stale'
+        allowed = self.directional_latch.evaluate(allowed)
+        if not allowed and reason == 'clear':
+            reason = 'release_key_or_press_k_then_command_again'
+        self.safety_stop_active = not allowed
+        if reason != self.directional_reason:
+            self.get_logger().info(f'directional safety: {reason}')
+            self.directional_reason = reason
+        return (left_rpm, right_rpm) if allowed else (0, 0)
 
     def get_obstacle_state(self):
         now = self.get_clock().now()

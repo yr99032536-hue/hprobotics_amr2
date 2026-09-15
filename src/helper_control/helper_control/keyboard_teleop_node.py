@@ -98,6 +98,7 @@ class KeyboardTeleopNode(Node):
             self.last_linear = 0.0
             self.last_angular = 0.0
             self.stopped = True
+            self.publisher.publish(twist)
 
         if elapsed <= self.key_timeout or not self.stopped:
             self.publisher.publish(twist)

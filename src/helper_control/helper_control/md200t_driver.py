@@ -32,7 +32,9 @@ class MD200TDriver:
         self.TMID = 184
         self.PID_PNT_VEL_CMD = 207
         self.PID_TQ_OFF = 5
-        self.PID_MAIN_BC = 124
+        # PID 124 is MIN_SSSD (a TWO-byte acceleration/deceleration limit),
+        # not a broadcast switch. Never write it during startup/shutdown.
+        self.PID_REQ_PID_DATA = 4
         self.PID_COM_WATCH_DELAY = 185
         self.PID_COMMAND = 10
         self.PID_MAIN_DATA = 193
@@ -102,7 +104,6 @@ class MD200TDriver:
         self.send_param(81, 0, 1)
         self.send_param(92, 0, 1)
         self.send_param(self.PID_COM_WATCH_DELAY, self.com_watch_delay, 2)
-        self.send_param(self.PID_MAIN_BC, 1, 1)
         return True
 
     def brake_motor(self):
@@ -172,8 +173,17 @@ class MD200TDriver:
         data = bytearray()
 
         with self.lock:
+            original_timeout = self.serial_port.timeout
             try:
                 while time.monotonic() < deadline:
+                    # The port defaults to 100 ms, longer than the motor loop's
+                    # 20 ms feedback budget. Bound each blocking read by the
+                    # remaining budget so scan/TF callbacks can run on time.
+                    remaining = max(0.0, deadline - time.monotonic())
+                    self.serial_port.timeout = (
+                        remaining if original_timeout is None
+                        else min(original_timeout, remaining)
+                    )
                     waiting = self.serial_port.in_waiting
                     chunk = self.serial_port.read(waiting or 1)
                     if chunk:
@@ -181,6 +191,8 @@ class MD200TDriver:
             except Exception as exc:
                 print(f'[ERROR] raw read failed: {exc}')
                 return b''
+            finally:
+                self.serial_port.timeout = original_timeout
 
         return bytes(data)
 
@@ -218,8 +230,9 @@ class MD200TDriver:
             self.RMID,
             self.TMID,
             self.robot_id,
+            self.PID_REQ_PID_DATA,
+            1,
             pid,
-            0,
         ])
         request = request_no_chk + bytes([
             self._calculate_checksum(request_no_chk)
@@ -230,11 +243,17 @@ class MD200TDriver:
         expected_total = 6 + expected_size
 
         with self.lock:
+            original_timeout = self.serial_port.timeout
             try:
                 self.serial_port.reset_input_buffer()
                 self.serial_port.write(request)
 
                 while time.monotonic() < deadline:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    self.serial_port.timeout = (
+                        remaining if original_timeout is None
+                        else min(original_timeout, remaining)
+                    )
                     chunk = self.serial_port.read(1)
                     if not chunk:
                         continue
@@ -252,14 +271,19 @@ class MD200TDriver:
                         expected_total = 6 + data_size
                         if len(response) >= expected_total:
                             packet = bytes(response[:expected_total])
-                            return self._parse_pid_response(
+                            parsed = self._parse_pid_response(
                                 packet,
                                 pid,
                                 expected_size,
                             )
+                            if parsed is not None:
+                                return parsed
+                            del response[:expected_total]
             except Exception as exc:
                 print(f'[ERROR] PID read failed pid={pid}: {exc}')
                 return None
+            finally:
+                self.serial_port.timeout = original_timeout
 
         return None
 
@@ -277,6 +301,8 @@ class MD200TDriver:
         if packet[2] != self.robot_id or packet[3] != pid:
             return None
         if packet[4] != expected_size:
+            return None
+        if len(packet) != expected_size + 6:
             return None
 
         return packet[5:-1]
@@ -316,7 +342,6 @@ class MD200TDriver:
 
         self.send_rpm_command(0, 0)
         time.sleep(0.1)
-        self.send_param(self.PID_MAIN_BC, 0, 1)
 
     def disconnect(self):
         if self.serial_port and self.serial_port.is_open:
