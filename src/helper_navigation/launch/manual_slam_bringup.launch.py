@@ -34,8 +34,9 @@ def generate_launch_description():
             default_value=EnvironmentVariable(
                 'AMR_FRONT_LIDAR_PORT',
                 default_value=(
-                    '/dev/serial/by-path/'
-                    'platform-3610000.usb-usb-0:2.3:1.0-port0'
+                    '/dev/serial/by-id/'
+                    'usb-Silicon_Labs_CP2102_USB_to_UART_'
+                    'Bridge_Controller_0001-if00-port0'
                 ),
             ),
             description='Serial port for the front SLAM LiDAR.',
@@ -66,6 +67,15 @@ def generate_launch_description():
             default_value='False',
             description='Use simulation clock if true.',
         ),
+        DeclareLaunchArgument(
+            'directional_safety_enabled',
+            default_value='false',
+            description='Experimental swept-path safety; validate footprint before enabling.',
+        ),
+        DeclareLaunchArgument(
+            'directional_legacy_scan_filter', default_value='false',
+            description='Legacy angle/range exclusions: creates a rear blind sector.',
+        ),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([
                 PathJoinSubstitution([
@@ -88,6 +98,13 @@ def generate_launch_description():
                 ])
             ]),
         ),
+        # Continuous wheel joints need joint_states for RobotModel/TF completeness.
+        Node(
+            package='joint_state_publisher',
+            executable='joint_state_publisher',
+            name='joint_state_publisher',
+            output='screen',
+        ),
         Node(
             package='helper_control',
             executable='motor_driver',
@@ -96,6 +113,10 @@ def generate_launch_description():
             parameters=[{
                 'serial_port': ParameterValue(motor_port, value_type=str),
                 'cmd_vel_topic': ParameterValue(cmd_vel_topic, value_type=str),
+                'directional_safety_enabled': ParameterValue(
+                    LaunchConfiguration('directional_safety_enabled'), value_type=bool),
+                'directional_legacy_scan_filter': ParameterValue(
+                    LaunchConfiguration('directional_legacy_scan_filter'), value_type=bool),
             }],
         ),
         IncludeLaunchDescription(
