@@ -3,7 +3,8 @@
 
   <xacro:property name="wheel_radius" value="0.065"/>
   <xacro:property name="wheel_width" value="0.03"/>
-  <xacro:property name="track_width" value="0.400"/>
+  <!-- Measured drive-wheel center spacing; wheels sit inside the body shell. -->
+  <xacro:property name="track_width" value="0.190"/>
 
   <xacro:property name="base_length" value="0.400"/>
   <xacro:property name="base_width" value="0.320"/>
